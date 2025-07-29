@@ -538,5 +538,6 @@ if __name__ == "__main__":
     """)
     
     # Uncomment to run the bot
-    # bot = ReplySaveBot()
-    # bot.run()
+
+    bot = ReplySaveBot()
+    bot.run()
