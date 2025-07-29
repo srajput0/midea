@@ -86,6 +86,11 @@ class ReplySaveBot:
             CommandHandler("save", self.save_command, filters=filters.REPLY)
         )
         
+        # Get media command
+        self.application.add_handler(
+            CommandHandler("get", self.get_command)
+        )
+        
         # Stats command
         self.application.add_handler(
             CommandHandler("stats", self.stats_command)
@@ -105,6 +110,11 @@ class ReplySaveBot:
         self.application.add_handler(
             CommandHandler("start", self.start_command)
         )
+        
+        # Message handler for media name requests (non-command messages)
+        self.application.add_handler(
+            MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_media_request)
+        )
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command"""
@@ -116,8 +126,13 @@ class ReplySaveBot:
 2. Reply to that media with `/save` command
 3. The media will be saved to the bot's storage
 
+📥 **How to retrieve media:**
+1. Send media filename to get the file
+2. Or use `/get <filename>` command
+
 📌 **Commands:**
 • `/save` - Save media (reply to media)
+• `/get <filename>` - Get saved media by filename
 • `/stats` - Show saved media statistics  
 • `/list` - List recent saved media
 • `/search <query>` - Search saved media
@@ -131,7 +146,10 @@ class ReplySaveBot:
 • Animations/GIFs 🎬
 • Video notes (round videos) 📹
 
-The bot works in your log group: `{LOG_GROUP_ID}`
+💡 **Tips:**
+• Just send the filename (without path) to get media
+• Use partial filenames for search
+• The bot works in your log group: `{LOG_GROUP_ID}`
         """
         await update.message.reply_text(start_text)
 
@@ -182,12 +200,200 @@ The bot works in your log group: `{LOG_GROUP_ID}`
                 f"📊 **Size:** {self.format_file_size(media_info.get('file_size', 0))}\n"
                 f"👤 **Original Sender:** {media_info.get('user_first_name', 'Unknown')}\n"
                 f"💾 **Saved By:** {update.effective_user.first_name}\n"
-                f"📅 **Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                f"📅 **Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                f"💡 **To retrieve:** Send `{saved_path.name}` or use `/get {saved_path.name}`",
                 parse_mode='Markdown'
             )
         else:
             await update.message.reply_text(
                 "❌ Failed to save media. Please try again."
+            )
+
+    async def get_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /get command to retrieve media by filename"""
+        if not context.args:
+            await update.message.reply_text(
+                "📥 **Usage:** `/get <filename>`\n"
+                "Example: `/get 20241129_143022_video.mp4`",
+                parse_mode='Markdown'
+            )
+            return
+            
+        filename = ' '.join(context.args)
+        await self.send_media_by_filename(update, filename)
+
+    async def handle_media_request(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle non-command text messages as potential media filename requests"""
+        message_text = update.message.text.strip()
+        
+        # Skip if message is too short or looks like regular conversation
+        if len(message_text) < 5 or ' ' in message_text:
+            return
+            
+        # Check if it looks like a filename (has extension or timestamp pattern)
+        if ('.' in message_text or 
+            any(message_text.endswith(ext) for ext in ['.mp4', '.jpg', '.jpeg', '.png', '.gif', '.mp3', '.ogg', '.pdf', '.doc', '.docx']) or
+            any(char.isdigit() for char in message_text[:8])):  # Check if starts with timestamp-like pattern
+            
+            await self.send_media_by_filename(update, message_text)
+
+    async def send_media_by_filename(self, update: Update, filename):
+        """Send media file by filename"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Search for exact filename or partial match
+            cursor.execute('''
+                SELECT saved_filename, file_path, media_type, file_size, caption, user_first_name, save_date
+                FROM saved_media 
+                WHERE saved_filename = ? OR saved_filename LIKE ?
+                ORDER BY save_date DESC
+                LIMIT 1
+            ''', (filename, f'%{filename}%'))
+            
+            result = cursor.fetchone()
+            conn.close()
+            
+            if not result:
+                # Try to find similar filenames for suggestions
+                await self.suggest_similar_files(update, filename)
+                return
+                
+            saved_filename, file_path, media_type, file_size, caption, sender, save_date = result
+            
+            # Check if file exists
+            if not Path(file_path).exists():
+                await update.message.reply_text(
+                    f"❌ **File not found on disk:** `{saved_filename}`\n"
+                    f"The file may have been moved or deleted.",
+                    parse_mode='Markdown'
+                )
+                return
+            
+            # Send typing action
+            await context.bot.send_chat_action(
+                chat_id=update.effective_chat.id,
+                action='upload_document'
+            )
+            
+            # Prepare file info message
+            date_obj = datetime.fromisoformat(save_date.replace('Z', '+00:00'))
+            info_text = (
+                f"📁 **{saved_filename}**\n"
+                f"📂 Type: {media_type.title()}\n"
+                f"📊 Size: {self.format_file_size(file_size or 0)}\n"
+                f"👤 Original Sender: {sender or 'Unknown'}\n"
+                f"📅 Saved: {date_obj.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+            
+            if caption:
+                info_text += f"\n💬 Caption: {caption}"
+            
+            # Send the media file based on its type
+            with open(file_path, 'rb') as media_file:
+                if media_type == 'photo':
+                    await context.bot.send_photo(
+                        chat_id=update.effective_chat.id,
+                        photo=media_file,
+                        caption=info_text,
+                        parse_mode='Markdown'
+                    )
+                elif media_type == 'video':
+                    await context.bot.send_video(
+                        chat_id=update.effective_chat.id,
+                        video=media_file,
+                        caption=info_text,
+                        parse_mode='Markdown'
+                    )
+                elif media_type == 'audio':
+                    await context.bot.send_audio(
+                        chat_id=update.effective_chat.id,
+                        audio=media_file,
+                        caption=info_text,
+                        parse_mode='Markdown'
+                    )
+                elif media_type == 'voice':
+                    await context.bot.send_voice(
+                        chat_id=update.effective_chat.id,
+                        voice=media_file,
+                        caption=info_text,
+                        parse_mode='Markdown'
+                    )
+                elif media_type == 'video_note':
+                    await context.bot.send_video_note(
+                        chat_id=update.effective_chat.id,
+                        video_note=media_file
+                    )
+                    # Send info separately for video notes (they don't support captions)
+                    await update.message.reply_text(info_text, parse_mode='Markdown')
+                elif media_type == 'animation':
+                    await context.bot.send_animation(
+                        chat_id=update.effective_chat.id,
+                        animation=media_file,
+                        caption=info_text,
+                        parse_mode='Markdown'
+                    )
+                else:  # document
+                    await context.bot.send_document(
+                        chat_id=update.effective_chat.id,
+                        document=media_file,
+                        caption=info_text,
+                        parse_mode='Markdown'
+                    )
+            
+            logger.info(f"Media sent: {saved_filename} to user {update.effective_user.id}")
+            
+        except Exception as e:
+            logger.error(f"Error sending media {filename}: {e}")
+            await update.message.reply_text(
+                f"❌ **Error sending media:** `{filename}`\n"
+                f"Please try again or contact support.",
+                parse_mode='Markdown'
+            )
+
+    async def suggest_similar_files(self, update: Update, filename):
+        """Suggest similar filenames when exact match not found"""
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Search for similar filenames
+            cursor.execute('''
+                SELECT saved_filename, media_type, save_date
+                FROM saved_media 
+                WHERE saved_filename LIKE ?
+                ORDER BY save_date DESC
+                LIMIT 5
+            ''', (f'%{filename}%',))
+            
+            results = cursor.fetchall()
+            conn.close()
+            
+            if results:
+                suggestion_text = f"❌ **File not found:** `{filename}`\n\n"
+                suggestion_text += "🔍 **Did you mean:**\n\n"
+                
+                for saved_filename, media_type, save_date in results:
+                    date_obj = datetime.fromisoformat(save_date.replace('Z', '+00:00'))
+                    suggestion_text += f"📄 `{saved_filename}`\n"
+                    suggestion_text += f"   📂 {media_type.title()} • 📅 {date_obj.strftime('%m/%d %H:%M')}\n\n"
+                
+                suggestion_text += "💡 **Tip:** Send the exact filename to get the media"
+                
+                await update.message.reply_text(suggestion_text, parse_mode='Markdown')
+            else:
+                await update.message.reply_text(
+                    f"❌ **File not found:** `{filename}`\n\n"
+                    f"💡 Use `/list` to see recent files or `/search <query>` to find media",
+                    parse_mode='Markdown'
+                )
+                
+        except Exception as e:
+            logger.error(f"Error suggesting files: {e}")
+            await update.message.reply_text(
+                f"❌ **File not found:** `{filename}`",
+                parse_mode='Markdown'
             )
 
     def extract_media_info(self, message):
@@ -437,6 +643,8 @@ The bot works in your log group: `{LOG_GROUP_ID}`
                 list_text += f"📄 `{filename}`\n"
                 list_text += f"   📂 {media_type.title()} • 👤 {sender or 'Unknown'} • 📅 {formatted_date}\n\n"
             
+            list_text += "💡 **Tip:** Send any filename to get the media file"
+            
             await update.message.reply_text(list_text, parse_mode='Markdown')
             
         except Exception as e:
@@ -487,6 +695,8 @@ The bot works in your log group: `{LOG_GROUP_ID}`
                     search_text += f"   💬 {caption[:50]}{'...' if len(caption) > 50 else ''}\n"
                 search_text += "\n"
             
+            search_text += "💡 **Tip:** Send any filename to get the media file"
+            
             await update.message.reply_text(search_text, parse_mode='Markdown')
             
         except Exception as e:
@@ -511,6 +721,7 @@ The bot works in your log group: `{LOG_GROUP_ID}`
         print(f"🤖 Bot is running...")
         print(f"📱 Log Group ID: {LOG_GROUP_ID}")
         print(f"💾 Media will be saved to: {self.base_dir}")
+        print("🔄 Media retrieval feature enabled")
         print("Press Ctrl+C to stop")
         
         self.application.run_polling()
@@ -535,9 +746,16 @@ if __name__ == "__main__":
     1. Send media to log group
     2. Reply to media with /save
     3. Media gets saved automatically
+    4. Send filename to retrieve media
+    5. Use /get <filename> to retrieve media
+    
+    🆕 New Features:
+    • Send any saved filename to get the media
+    • Smart filename suggestions if exact match not found
+    • Support for all media types (video, photo, audio, etc.)
+    • Automatic media info display when sending files
     """)
     
     # Uncomment to run the bot
-
     bot = ReplySaveBot()
     bot.run()
