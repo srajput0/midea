@@ -2,7 +2,6 @@ import os
 import json
 import sqlite3
 import logging
-import asyncio
 from datetime import datetime
 from pathlib import Path
 from telegram import Update
@@ -22,7 +21,6 @@ class ReplySaveBot:
     def __init__(self):
         self.application = Application.builder().token(BOT_TOKEN).build()
         self.setup_storage()
-        self.setup_database()  # ADD THIS LINE - This was missing!
         self.setup_handlers()
         
     def setup_storage(self):
@@ -42,6 +40,9 @@ class ReplySaveBot:
         # Create all directories
         for directory in self.media_dirs.values():
             directory.mkdir(parents=True, exist_ok=True)
+            
+        # Add import for asyncio at the top of the file
+        import asyncio
         
     def setup_database(self):
         """Setup SQLite database for saved media tracking"""
@@ -144,7 +145,7 @@ class ReplySaveBot:
             
             if not videos:
                 # If no videos, send welcome message
-                start_text = f"""
+                start_text = """
 🤖 **Reply Save Bot** 
 
 📋 **How to use:**
@@ -234,6 +235,7 @@ class ReplySaveBot:
                     
                     # Small delay between videos to avoid flooding
                     if index < len(videos):  # Don't delay after the last video
+                        import asyncio
                         await asyncio.sleep(1)
                         
                 except Exception as e:
@@ -326,7 +328,7 @@ class ReplySaveBot:
             return
             
         filename = ' '.join(context.args)
-        await self.send_media_by_filename(update, context, filename)
+        await self.send_media_by_filename(update, filename)
 
     async def handle_media_request(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle non-command text messages as potential media filename requests"""
@@ -341,9 +343,9 @@ class ReplySaveBot:
             any(message_text.endswith(ext) for ext in ['.mp4', '.jpg', '.jpeg', '.png', '.gif', '.mp3', '.ogg', '.pdf', '.doc', '.docx']) or
             any(char.isdigit() for char in message_text[:8])):  # Check if starts with timestamp-like pattern
             
-            await self.send_media_by_filename(update, context, message_text)
+            await self.send_media_by_filename(update, message_text)
 
-    async def send_media_by_filename(self, update: Update, context: ContextTypes.DEFAULT_TYPE, filename):
+    async def send_media_by_filename(self, update: Update, filename):
         """Send media file by filename"""
         try:
             conn = sqlite3.connect(self.db_path)
@@ -776,4 +778,276 @@ class ReplySaveBot:
             cursor.execute('''
                 SELECT saved_filename, media_type, user_first_name, caption, save_date 
                 FROM saved_media 
-                WHERE saved_filename LIKE ? OR caption
+                WHERE saved_filename LIKE ? OR caption LIKE ? OR user_first_name LIKE ?
+                ORDER BY save_date DESC
+                LIMIT 15
+            ''', (f'%{query}%', f'%{query}%', f'%{query}%'))
+            
+            results = cursor.fetchall()
+            conn.close()
+            
+            if not results:
+                await update.message.reply_text(f"🔍 No results found for: `{query}`", parse_mode='Markdown')
+                return
+                
+            search_text = f"🔍 **Search Results for:** `{query}`\n\n"
+            
+            for filename, media_type, sender, caption, save_date in results:
+                date_obj = datetime.fromisoformat(save_date.replace('Z', '+00:00'))
+                formatted_date = date_obj.strftime("%m/%d %H:%M")
+                
+                search_text += f"📄 `{filename}`\n"
+                search_text += f"   📂 {media_type.title()} • 👤 {sender or 'Unknown'} • 📅 {formatted_date}\n"
+                
+                if caption:
+                    search_text += f"   💬 {caption[:50]}{'...' if len(caption) > 50 else ''}\n"
+                search_text += "\n"
+            
+            search_text += "💡 **Tip:** Send any filename to get the media file"
+            
+            await update.message.reply_text(search_text, parse_mode='Markdown')
+            
+        except Exception as e:
+            logger.error(f"Search error: {e}")
+            await update.message.reply_text("❌ Error performing search")
+
+    async def delete_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Delete specific saved media"""
+        if not context.args:
+            await update.message.reply_text(
+                "🗑️ **Usage:** `/delete <filename>`\n"
+                "Example: `/delete 20241129_143022_video.mp4`\n\n"
+                "💡 Use `/list` to see available files",
+                parse_mode='Markdown'
+            )
+            return
+            
+        filename = ' '.join(context.args)
+        
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Search for the file
+            cursor.execute('''
+                SELECT saved_filename, file_path, media_type, file_size, user_first_name, save_date
+                FROM saved_media 
+                WHERE saved_filename = ? OR saved_filename LIKE ?
+                ORDER BY save_date DESC
+                LIMIT 1
+            ''', (filename, f'%{filename}%'))
+            
+            result = cursor.fetchone()
+            
+            if not result:
+                conn.close()
+                await update.message.reply_text(
+                    f"❌ **File not found:** `{filename}`\n\n"
+                    f"💡 Use `/list` to see available files or `/search <query>` to find media",
+                    parse_mode='Markdown'
+                )
+                return
+            
+            saved_filename, file_path, media_type, file_size, sender, save_date = result
+            
+            # Delete from database
+            cursor.execute('DELETE FROM saved_media WHERE saved_filename = ?', (saved_filename,))
+            conn.commit()
+            conn.close()
+            
+            # Delete physical file
+            file_deleted = False
+            if Path(file_path).exists():
+                try:
+                    Path(file_path).unlink()
+                    file_deleted = True
+                except Exception as e:
+                    logger.error(f"Error deleting physical file {file_path}: {e}")
+            
+            # Format date
+            date_obj = datetime.fromisoformat(save_date.replace('Z', '+00:00'))
+            
+            # Send confirmation
+            confirmation_text = (
+                f"✅ **Media Deleted Successfully!**\n\n"
+                f"📁 **File:** `{saved_filename}`\n"
+                f"📂 **Type:** {media_type.title()}\n"
+                f"📊 **Size:** {self.format_file_size(file_size or 0)}\n"
+                f"👤 **Original Sender:** {sender or 'Unknown'}\n"
+                f"📅 **Was Saved:** {date_obj.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"🗑️ **Deleted By:** {update.effective_user.first_name}\n"
+                f"💾 **File Status:** {'✅ Removed from disk' if file_deleted else '⚠️ Database entry removed (file not found on disk)'}"
+            )
+            
+            await update.message.reply_text(confirmation_text, parse_mode='Markdown')
+            logger.info(f"Media deleted: {saved_filename} by user {update.effective_user.id}")
+            
+        except Exception as e:
+            logger.error(f"Delete error: {e}")
+            await update.message.reply_text(
+                f"❌ **Error deleting media:** `{filename}`\n"
+                f"Please try again or contact support.",
+                parse_mode='Markdown'
+            )
+
+    async def delete_all_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Delete all saved media with confirmation"""
+        try:
+            # Check if confirmation argument is provided
+            if not context.args or context.args[0].lower() != 'confirm':
+                # Get total count for warning
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute('SELECT COUNT(*), SUM(file_size) FROM saved_media')
+                total_count, total_size = cursor.fetchone()
+                conn.close()
+                
+                if total_count == 0:
+                    await update.message.reply_text(
+                        "📂 **No saved media found to delete.**",
+                        parse_mode='Markdown'
+                    )
+                    return
+                
+                warning_text = (
+                    f"⚠️ **WARNING: DELETE ALL MEDIA**\n\n"
+                    f"📊 **This will permanently delete:**\n"
+                    f"📁 **{total_count} media files**\n"
+                    f"💾 **{self.format_file_size(total_size or 0)} of storage**\n\n"
+                    f"🚨 **This action cannot be undone!**\n\n"
+                    f"💡 **To confirm deletion, use:**\n"
+                    f"`/deleteall confirm`"
+                )
+                
+                await update.message.reply_text(warning_text, parse_mode='Markdown')
+                return
+            
+            # Perform deletion with confirmation
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            # Get all files for deletion
+            cursor.execute('SELECT saved_filename, file_path FROM saved_media')
+            all_files = cursor.fetchall()
+            
+            if not all_files:
+                conn.close()
+                await update.message.reply_text(
+                    "📂 **No saved media found to delete.**",
+                    parse_mode='Markdown'
+                )
+                return
+            
+            # Get stats before deletion
+            cursor.execute('SELECT COUNT(*), SUM(file_size) FROM saved_media')
+            total_count, total_size = cursor.fetchone()
+            
+            # Delete all from database
+            cursor.execute('DELETE FROM saved_media')
+            conn.commit()
+            conn.close()
+            
+            # Delete physical files
+            files_deleted = 0
+            files_not_found = 0
+            
+            await update.message.reply_text(
+                f"🔄 **Deleting {total_count} media files...**",
+                parse_mode='Markdown'
+            )
+            
+            for saved_filename, file_path in all_files:
+                try:
+                    if Path(file_path).exists():
+                        Path(file_path).unlink()
+                        files_deleted += 1
+                    else:
+                        files_not_found += 1
+                except Exception as e:
+                    logger.error(f"Error deleting file {file_path}: {e}")
+                    files_not_found += 1
+            
+            # Send final confirmation
+            confirmation_text = (
+                f"✅ **ALL MEDIA DELETED SUCCESSFULLY!**\n\n"
+                f"📊 **Deletion Summary:**\n"
+                f"🗑️ **Database entries removed:** {total_count}\n"
+                f"💾 **Storage freed:** {self.format_file_size(total_size or 0)}\n"
+                f"📁 **Files deleted from disk:** {files_deleted}\n"
+                f"⚠️ **Files not found on disk:** {files_not_found}\n\n"
+                f"👤 **Deleted by:** {update.effective_user.first_name}\n"
+                f"📅 **Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                f"💡 **Start saving new media with /save command**"
+            )
+            
+            await update.message.reply_text(confirmation_text, parse_mode='Markdown')
+            logger.info(f"All media deleted by user {update.effective_user.id}: {total_count} files")
+            
+        except Exception as e:
+            logger.error(f"Delete all error: {e}")
+            await update.message.reply_text(
+                "❌ **Error deleting all media.** Please try again or contact support.",
+                parse_mode='Markdown'
+            )
+
+    def format_file_size(self, size_bytes):
+        """Format file size in human readable format"""
+        if not size_bytes:
+            return "0 B"
+            
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if size_bytes < 1024.0:
+                return f"{size_bytes:.1f} {unit}"
+            size_bytes /= 1024.0
+        return f"{size_bytes:.1f} TB"
+
+    def run(self):
+        """Start the bot"""
+        logger.info("Starting Reply Save Bot...")
+        logger.info(f"Log Group ID: {LOG_GROUP_ID}")
+        print(f"🤖 Bot is running...")
+        print(f"📱 Log Group ID: {LOG_GROUP_ID}")
+        print(f"💾 Media will be saved to: {self.base_dir}")
+        print("🔄 Media retrieval feature enabled")
+        print("Press Ctrl+C to stop")
+        
+        self.application.run_polling()
+
+if __name__ == "__main__":
+    print("""
+    🔧 Setup Instructions:
+    
+    1. Replace BOT_TOKEN with your actual bot token
+    2. Replace LOG_GROUP_ID with your log group ID
+    3. Add bot to your log group as admin
+    4. Install dependencies: pip install python-telegram-bot
+    5. Run: python reply_save_bot.py
+    
+    📝 How to get Log Group ID:
+    1. Add bot to your group
+    2. Send a message in the group
+    3. Check bot logs for chat_id (negative number)
+    4. Use that ID as LOG_GROUP_ID
+    
+    💡 Usage:
+    1. Send media to log group
+    2. Reply to media with /save
+    3. Media gets saved automatically
+    4. Send filename to retrieve media
+    5. Use /get <filename> to retrieve media
+    6. Use /delete <filename> to delete specific media
+    7. Use /deleteall confirm to delete all media
+    
+    🆕 New Features:
+    • Send any saved filename to get the media
+    • Smart filename suggestions if exact match not found
+    • Support for all media types (video, photo, audio, etc.)
+    • Automatic media info display when sending files
+    • Delete specific media files
+    • Delete all media with confirmation
+    • Turn-by-turn video playback with /start command
+    """)
+    
+    # Uncomment to run the bot
+    bot = ReplySaveBot()
+    bot.run()
