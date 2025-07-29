@@ -41,8 +41,8 @@ class ReplySaveBot:
         for directory in self.media_dirs.values():
             directory.mkdir(parents=True, exist_ok=True)
             
-        # Setup database
-        self.setup_database()
+        # Add import for asyncio at the top of the file
+        import asyncio
         
     def setup_database(self):
         """Setup SQLite database for saved media tracking"""
@@ -117,8 +117,25 @@ class ReplySaveBot:
         )
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /start command"""
-        start_text = """
+        """Handle /start command - sends saved videos turn by turn"""
+        try:
+            # Get all saved videos in order
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT saved_filename, file_path, file_size, caption, user_first_name, save_date
+                FROM saved_media 
+                WHERE media_type = 'video'
+                ORDER BY save_date ASC
+            ''')
+            
+            videos = cursor.fetchall()
+            conn.close()
+            
+            if not videos:
+                # If no videos, send welcome message
+                start_text = """
 🤖 **Reply Save Bot** 
 
 📋 **How to use:**
@@ -150,8 +167,86 @@ class ReplySaveBot:
 • Just send the filename (without path) to get media
 • Use partial filenames for search
 • The bot works in your log group: `{LOG_GROUP_ID}`
-        """
-        await update.message.reply_text(start_text)
+
+❌ **No videos saved yet!** Use /save command to save videos first.
+                """
+                await update.message.reply_text(start_text)
+                return
+            
+            # Send initial message
+            await update.message.reply_text(
+                f"🎬 **Sending {len(videos)} saved videos in order...**\n\n"
+                f"📹 Starting with the first saved video...",
+                parse_mode='Markdown'
+            )
+            
+            # Send each video turn by turn
+            for index, (saved_filename, file_path, file_size, caption, sender, save_date) in enumerate(videos, 1):
+                try:
+                    # Check if file exists
+                    if not Path(file_path).exists():
+                        await update.message.reply_text(
+                            f"❌ **Video {index} not found:** `{saved_filename}`",
+                            parse_mode='Markdown'
+                        )
+                        continue
+                    
+                    # Send typing action
+                    await context.bot.send_chat_action(
+                        chat_id=update.effective_chat.id,
+                        action='upload_video'
+                    )
+                    
+                    # Prepare video info
+                    date_obj = datetime.fromisoformat(save_date.replace('Z', '+00:00'))
+                    info_text = (
+                        f"📹 **Video {index}/{len(videos)}**\n"
+                        f"📁 {saved_filename}\n"
+                        f"📊 Size: {self.format_file_size(file_size or 0)}\n"
+                        f"👤 Original Sender: {sender or 'Unknown'}\n"
+                        f"📅 Saved: {date_obj.strftime('%Y-%m-%d %H:%M:%S')}"
+                    )
+                    
+                    if caption:
+                        info_text += f"\n💬 Caption: {caption}"
+                    
+                    # Send the video
+                    with open(file_path, 'rb') as video_file:
+                        await context.bot.send_video(
+                            chat_id=update.effective_chat.id,
+                            video=video_file,
+                            caption=info_text,
+                            parse_mode='Markdown'
+                        )
+                    
+                    logger.info(f"Sent video {index}: {saved_filename} to user {update.effective_user.id}")
+                    
+                    # Small delay between videos to avoid flooding
+                    if index < len(videos):  # Don't delay after the last video
+                        import asyncio
+                        await asyncio.sleep(1)
+                        
+                except Exception as e:
+                    logger.error(f"Error sending video {saved_filename}: {e}")
+                    await update.message.reply_text(
+                        f"❌ **Error sending video {index}:** `{saved_filename}`",
+                        parse_mode='Markdown'
+                    )
+                    continue
+            
+            # Send completion message
+            await update.message.reply_text(
+                f"✅ **All {len(videos)} videos sent successfully!**\n\n"
+                f"💡 Use `/save` to save more videos or send filename to get specific media.",
+                parse_mode='Markdown'
+            )
+            
+        except Exception as e:
+            logger.error(f"Error in start command: {e}")
+            await update.message.reply_text(
+                "❌ **Error retrieving videos.** Please try again or contact support.",
+                parse_mode='Markdown'
+            )
 
     async def save_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /save command - only works as reply to media"""
@@ -201,7 +296,8 @@ class ReplySaveBot:
                 f"👤 **Original Sender:** {media_info.get('user_first_name', 'Unknown')}\n"
                 f"💾 **Saved By:** {update.effective_user.first_name}\n"
                 f"📅 **Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                f"💡 **To retrieve:** Send `{saved_path.name}` or use `/get {saved_path.name}`",
+                f"💡 **To retrieve:** Send `{saved_path.name}` or use `/get {saved_path.name}`\n"
+                f"📺 **Use /start to see all saved videos in order**",
                 parse_mode='Markdown'
             )
         else:
